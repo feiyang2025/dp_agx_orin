@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# Jetson AGX Xavier Environment Validation Script
+# Jetson Environment Validation Script (AGX Xavier / AGX Orin)
 # DragonPilot 0.10.3 - Phase 0 Validation
 # =============================================================================
 set -e
@@ -19,8 +19,8 @@ check_fail() { echo -e "  ${RED}[FAIL]${NC} $1"; ((FAIL++)); }
 check_warn() { echo -e "  ${YELLOW}[WARN]${NC} $1"; ((WARN++)); }
 
 echo "=============================================="
-echo " Jetson AGX Xavier - Environment Validation"
-echo " DragonPilot 0.10.3 Port"
+echo " Jetson - Environment Validation"
+echo " DragonPilot 0.10.3 Port (Xavier / Orin)"
 echo "=============================================="
 echo ""
 
@@ -33,8 +33,8 @@ else
 fi
 echo ""
 
-# --- 2. Architecture ---
-echo "2. Architecture"
+# --- 2. Architecture & Board ---
+echo "2. Architecture & Board"
 ARCH=$(uname -m)
 if [ "$ARCH" = "aarch64" ]; then
   check_pass "Architecture: $ARCH"
@@ -42,9 +42,26 @@ else
   check_fail "Expected aarch64, got: $ARCH"
 fi
 
+BOARD="unknown"
+if [ -f /proc/device-tree/model ]; then
+  BOARD=$(tr -d '\0' < /proc/device-tree/model)
+fi
+case "$BOARD" in
+  *Orin*) check_pass "Board model: $BOARD (Orin)"; JETSOC="orin" ;;
+  *Xavier*|*XAVIER*) check_pass "Board model: $BOARD (Xavier)"; JETSOC="xavier" ;;
+  *) check_warn "Board model unknown: '$BOARD'"; JETSOC="unknown" ;;
+esac
+
+# L4T / JetPack version check: JP5 = R35.x, JP6 = R36.x
 if [ -f /etc/nv_tegra_release ]; then
   TEGRA_VER=$(head -1 /etc/nv_tegra_release)
   check_pass "Tegra release: $TEGRA_VER"
+  L4T_MAJOR=$(head -1 /etc/nv_tegra_release | grep -oP '(?<=R)\d+' || echo "0")
+  case "$L4T_MAJOR" in
+    36) check_pass "L4T R36 detected (JetPack 6)" ;;
+    35) if [ "$JETSOC" = "orin" ]; then check_warn "L4T R35 on Orin (JP5) - JP6 upgrade recommended"; else check_pass "L4T R35 detected (JetPack 5)"; fi ;;
+    *) check_warn "L4T R$L4T_MAJOR untested with this port" ;;
+  esac
 else
   check_fail "/etc/nv_tegra_release not found - is this a Jetson?"
 fi
@@ -52,11 +69,17 @@ echo ""
 
 # --- 3. Python ---
 echo "3. Python"
-if command -v python3.11 &>/dev/null; then
-  PY_VER=$(python3.11 --version 2>&1)
-  check_pass "Python 3.11: $PY_VER"
-else
-  check_fail "Python 3.11 not found (run: sudo apt install python3.11 python3.11-dev python3.11-venv)"
+PY_OK=""
+for pver in python3.11 python3.12 python3.10; do
+  if command -v "$pver" &>/dev/null; then
+    PY_VER=$("$pver" --version 2>&1)
+    check_pass "Python found: $PY_VER"
+    PY_OK="$pver"
+    break
+  fi
+done
+if [ -z "$PY_OK" ]; then
+  check_fail "No suitable Python (3.10/3.11/3.12) found"
 fi
 
 if [ -n "$VIRTUAL_ENV" ]; then
@@ -71,7 +94,13 @@ echo ""
 echo "4. CUDA"
 if command -v nvcc &>/dev/null; then
   CUDA_VER=$(nvcc --version | grep "release" | awk '{print $6}')
-  check_pass "CUDA: $CUDA_VER"
+  CUDA_MAJOR=$(nvcc --version | grep -oP '(?<=release )\d+' || echo "0")
+  case "$CUDA_MAJOR" in
+    12) check_pass "CUDA: $CUDA_VER (JetPack 6)" ;;
+    13) check_warn "CUDA: $CUDA_VER (JetPack 7) - tinygrad compatibility unverified" ;;
+    11) if [ "$JETSOC" = "xavier" ]; then check_pass "CUDA: $CUDA_VER (JetPack 5, Xavier)"; else check_warn "CUDA $CUDA_VER on Orin - JP6 (CUDA 12) recommended"; fi ;;
+    *) check_warn "CUDA major version $CUDA_MAJOR untested" ;;
+  esac
 else
   check_fail "nvcc not found - CUDA toolkit not installed or not in PATH"
 fi
@@ -197,24 +226,61 @@ echo ""
 
 # --- 12. Thermal Zones ---
 echo "12. Thermal Zones"
-THERMAL_ZONES=("CPU-therm" "GPU-therm" "Tdiode_tegra" "PMIC-Die")
+THERMAL_ZONES=("CPU-therm" "GPU-therm" "CV0-therm" "CV1-therm" "Tdiode_tegra" "TdiodeTEGRA" "PMIC-Die")
 for tz_name in "${THERMAL_ZONES[@]}"; do
-  found=false
   for tz_dir in /sys/devices/virtual/thermal/thermal_zone*; do
     if [ -f "$tz_dir/type" ]; then
       tz_type=$(cat "$tz_dir/type" 2>/dev/null)
       if [ "$tz_type" = "$tz_name" ]; then
         temp=$(cat "$tz_dir/temp" 2>/dev/null || echo "0")
         check_pass "Thermal zone '$tz_name': $((temp / 1000))C"
-        found=true
         break
       fi
     fi
   done
-  if ! $found; then
-    check_warn "Thermal zone '$tz_name' not found"
-  fi
 done
+
+# At least one CPU/GPU zone must exist on either board
+if grep -qs -e 'CPU-therm' -e 'CV0-therm' /sys/devices/virtual/thermal/thermal_zone*/type && \
+   grep -qs -e 'GPU-therm' -e 'CV1-therm' /sys/devices/virtual/thermal/thermal_zone*/type; then
+  check_pass "Core thermal zones present"
+else
+  check_warn "Expected CPU/GPU thermal zones not all found"
+fi
+echo ""
+
+# --- 13. Power Monitor (INA3221) ---
+echo "13. Power Monitor"
+INA_DIRS=$(ls -d /sys/bus/i2c/drivers/ina3221*/*/hwmon/hwmon* 2>/dev/null || true)
+if [ -n "$INA_DIRS" ]; then
+  check_pass "INA3221 power monitor found: $INA_DIRS"
+else
+  check_warn "No INA3221 hwmon found (power draw reporting will read 0W)"
+fi
+echo ""
+
+# --- 14. Cameras ---
+echo "14. Cameras"
+CAM_DEVICES=$(ls /dev/video* 2>/dev/null | wc -l)
+if [ "$CAM_DEVICES" -gt 0 ]; then
+  check_pass "$CAM_DEVICES V4L2 device(s): $(ls /dev/video* | tr '\n' ' ')"
+else
+  check_warn "No /dev/video* devices (connect USB camera(s))"
+fi
+
+for cam in /dev/video*; do
+  [ -e "$cam" ] || continue
+  DRIVER=$(basename "$(readlink -f "/sys/class/video4linux/$(basename "$cam")/device/driver" 2>/dev/null)" 2>/dev/null || echo "?")
+  case "$DRIVER" in
+    uvcvideo) echo -e "    ${GREEN}[UVC]${NC} $cam (USB)" ;;
+    tegra-video|vi) echo -e "    ${GREEN}[CSI/GMSL]${NC} $cam ($DRIVER)" ;;
+    *) echo -e "    [?] $cam driver=$DRIVER" ;;
+  esac
+done
+
+if [ -n "$ROAD_CAM" ]; then :; else ROAD_CAM="unset"; fi
+if [ -n "$WIDE_CAM" ]; then :; else WIDE_CAM="unset"; fi
+check_warn "Camera env: ROAD_CAM=$ROAD_CAM WIDE_CAM=$WIDE_CAM DRIVER_CAM=${DRIVER_CAM:-unset} USE_MJPEG=${USE_MJPEG:-unset} (set before launch)"
 echo ""
 
 # --- Summary ---
