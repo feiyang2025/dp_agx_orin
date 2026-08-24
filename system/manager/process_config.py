@@ -9,6 +9,9 @@ from openpilot.system.manager.process import PythonProcess, NativeProcess, Daemo
 
 WEBCAM = os.getenv("USE_WEBCAM") is not None or JETSON
 LITE = os.getenv("LITE") is not None
+# DMS: skip driver-monitoring processes when no driver camera is configured
+# (e.g. Orin port without DMS). On TICI/stock PC the original behavior is kept.
+DRIVER_CAM = os.getenv("DRIVER_CAM") is not None or (not WEBCAM and not JETSON)
 
 def driverview(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started or params.get_bool("IsDriverViewEnabled")
@@ -88,7 +91,9 @@ procs = [
   PythonProcess("timed", "system.timed", always_run, enabled=not PC),
 
   PythonProcess("modeld", "selfdrive.modeld.modeld", only_onroad),
-  PythonProcess("dmonitoringmodeld", "selfdrive.modeld.dmonitoringmodeld", driverview, enabled=(WEBCAM or not PC or JETSON)),
+  # DMS: disabled when no driver camera is configured
+  PythonProcess("dmonitoringmodeld", "selfdrive.modeld.dmonitoringmodeld", driverview,
+                enabled=(WEBCAM or not PC or JETSON) and DRIVER_CAM),
 
   PythonProcess("sensord", "system.sensord.sensord", only_onroad, enabled=TICI),
   PythonProcess("ui", "selfdrive.ui.ui", always_run, restart_if_crash=True),
@@ -103,7 +108,8 @@ procs = [
   PythonProcess("selfdrived", "selfdrive.selfdrived.selfdrived", only_onroad),
   PythonProcess("card", "selfdrive.car.card", only_onroad),
   PythonProcess("deleter", "system.loggerd.deleter", always_run),
-  PythonProcess("dmonitoringd", "selfdrive.monitoring.dmonitoringd", driverview, enabled=(WEBCAM or not PC or JETSON)),
+  PythonProcess("dmonitoringd", "selfdrive.monitoring.dmonitoringd", driverview,
+                enabled=(WEBCAM or not PC or JETSON) and DRIVER_CAM),
   PythonProcess("qcomgpsd", "system.qcomgpsd.qcomgpsd", qcomgps, enabled=TICI),
   PythonProcess("pandad", "selfdrive.pandad.pandad", always_run),
   PythonProcess("paramsd", "selfdrive.locationd.paramsd", only_onroad),

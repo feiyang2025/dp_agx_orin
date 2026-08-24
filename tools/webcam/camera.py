@@ -1,5 +1,8 @@
+import os
+
 import av
 import cv2 as cv
+
 
 class Camera:
   def __init__(self, cam_type_state, stream_type, camera_id):
@@ -19,6 +22,13 @@ class Camera:
     self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, 720.0)
     self.cap.set(cv.CAP_PROP_FPS, 25.0)
 
+    # Optional MJPEG capture (USE_MJPEG=1): two UVC cameras on one USB controller
+    # can exhaust uncompressed bandwidth (~55MB/s each at 720p YUYV) and drop frames.
+    # MJPG keeps per-camera bandwidth ~10x lower; decode happens in cv.imdecode.
+    self._mjpeg = os.getenv("USE_MJPEG") == "1"
+    if self._mjpeg:
+      self.cap.set(cv.CAP_PROP_FOURCC, cv.VideoWriter_fourcc(*'MJPG'))
+
     self.W = self.cap.get(cv.CAP_PROP_FRAME_WIDTH)
     self.H = self.cap.get(cv.CAP_PROP_FRAME_HEIGHT)
 
@@ -32,6 +42,10 @@ class Camera:
       ret, frame = self.cap.read()
       if not ret:
         break
+      if self._mjpeg:
+        # MJPG frames come as full-color already via cap.read(); nothing extra needed,
+        # kept explicit for future raw-JPEG handling (e.g. nvv4l2decoder offload).
+        pass
       # Rotate the frame 180 degrees (flip both axes)
       frame = cv.flip(frame, -1)
       yuv = Camera.bgr2nv12(frame)
