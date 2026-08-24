@@ -98,3 +98,6 @@ Pipfile
 
 # rick - keep panda_tici standalone
 panda_tici/
+
+*.pdf
+!docs/**
