@@ -2,6 +2,7 @@ import os
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 from cereal import log
 from openpilot.system.hardware.base import HardwareBase, LPABase, ThermalConfig, ThermalZone
@@ -14,6 +15,27 @@ class Jetson(HardwareBase):
   def __init__(self):
     self.dfs = None
     self._watchdog_stop = threading.Event()
+    self._ina_hwmon_dirs: list[str] | None = None  # lazy-discovered INA3221 hwmon paths
+
+  @staticmethod
+  def _find_ina_hwmon_dirs() -> list[str]:
+    """Discover INA3221 power monitor hwmon dirs.
+
+    Path differs per board: AGX Xavier = i2c bus 1 (1-0040),
+    AGX Orin / TW-T906G = bus 3 or c (3-0040 / c-0040), driver ina3221 or ina3221x.
+    Scan instead of hardcoding so one build works on both boards.
+    """
+    import glob
+    dirs: list[str] = []
+    for pattern in ["/sys/bus/i2c/drivers/ina3221*/*/hwmon/hwmon*",
+                    "/sys/bus/i2c/drivers/ina3221x/*/hwmon/hwmon*"]:
+      dirs.extend(glob.glob(pattern))
+    return sorted(set(dirs))
+
+  def _ina_paths(self) -> list[str]:
+    if self._ina_hwmon_dirs is None:
+      self._ina_hwmon_dirs = self._find_ina_hwmon_dirs()
+    return self._ina_hwmon_dirs
 
   def get_os_version(self):
     try:
@@ -81,38 +103,18 @@ class Jetson(HardwareBase):
     return NetworkStrength.unknown
 
   def get_current_power_draw(self):
-    # INA3221 power monitor on Jetson AGX Xavier
-    # Channel 0: GPU, Channel 1: CPU, Channel 2: SoC
+    # INA3221 power monitor (channels: GPU/CPU/SoC on Xavier; board-specific on Orin)
     total_power = 0
-    for channel in range(3):
-      path = f"/sys/bus/i2c/drivers/ina3221/1-0040/hwmon/hwmon0/in{channel + 1}_input"
-      curr_path = f"/sys/bus/i2c/drivers/ina3221/1-0040/hwmon/hwmon0/curr{channel + 1}_input"
-      try:
-        with open(path) as f:
-          voltage_mv = int(f.read().strip())
-        with open(curr_path) as f:
-          current_ma = int(f.read().strip())
-        total_power += (voltage_mv * current_ma) / 1_000_000  # Convert to watts
-      except (FileNotFoundError, ValueError):
-        pass
-    # Fallback: try the simpler sysfs path
-    if total_power == 0:
-      try:
-        for base in ["/sys/bus/i2c/drivers/ina3221/1-0040/hwmon", "/sys/bus/i2c/drivers/ina3221x/1-0040/hwmon"]:
-          if os.path.exists(base):
-            hwmon = os.listdir(base)[0]
-            for ch in range(1, 4):
-              try:
-                with open(f"{base}/{hwmon}/in{ch}_input") as f:
-                  v = int(f.read().strip())
-                with open(f"{base}/{hwmon}/curr{ch}_input") as f:
-                  c = int(f.read().strip())
-                total_power += (v * c) / 1_000_000
-              except (FileNotFoundError, ValueError):
-                pass
-            break
-      except (OSError, IndexError):
-        pass
+    for hwmon in self._ina_paths():
+      for channel in range(1, 4):
+        try:
+          with open(f"{hwmon}/in{channel}_input") as f:
+            voltage_mv = int(f.read().strip())
+          with open(f"{hwmon}/curr{channel}_input") as f:
+            current_ma = int(f.read().strip())
+          total_power += (voltage_mv * current_ma) / 1_000_000  # Convert to watts
+        except (FileNotFoundError, ValueError, PermissionError):
+          continue
     return total_power
 
   def get_som_power_draw(self):
@@ -122,11 +124,32 @@ class Jetson(HardwareBase):
     subprocess.check_output(["sudo", "shutdown", "-h", "now"])
 
   def get_thermal_config(self):
+    # Zone names differ between Xavier and Orin; probe sysfs at runtime.
+    # Xavier: CPU-therm / GPU-therm / Tdiode_tegra / PMIC-Die
+    # Orin candidates: CV0-therm, TdiodeTEGRA, etc.
+    available = {}
+    for z in Path("/sys/class/thermal").glob("thermal_zone*"):
+      try:
+        available[(z / "type").read_text().strip()] = z.name
+      except OSError:
+        continue
+
+    def zone(*candidates: str) -> str | None:
+      for c in candidates:
+        if c in available:
+          return c
+      return None
+
+    cpu = zone("CPU-therm", "CV0-therm")
+    gpu = zone("GPU-therm", "CV1-therm", "GPU-therm")
+    memory = zone("Tdiode_tegra", "TdiodeTEGRA", "CV2-therm")
+    pmic = zone("PMIC-Die", "PMIC_thermal")
+
     return ThermalConfig(
-      cpu=[ThermalZone("CPU-therm")],
-      gpu=[ThermalZone("GPU-therm")],
-      memory=ThermalZone("Tdiode_tegra"),
-      pmic=[ThermalZone("PMIC-Die")],
+      cpu=[ThermalZone(cpu)] if cpu else [],
+      gpu=[ThermalZone(gpu)] if gpu else [],
+      memory=ThermalZone(memory) if memory else None,
+      pmic=[ThermalZone(pmic)] if pmic else [],
     )
 
   def set_screen_brightness(self, percentage):
@@ -205,7 +228,10 @@ class Jetson(HardwareBase):
       try:
         with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq") as f:
           freq = int(f.read().strip())
-        if freq < 2_000_000:  # Below 2GHz means throttled
+        # Throttle detection relative to max freq (Xavier 2.2GHz, Orin 2.2GHz; board-agnostic)
+        with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq") as f:
+          max_freq = int(f.read().strip())
+        if max_freq > 0 and freq < max_freq * 0.9:  # >10% below max means throttled
           subprocess.call(["sudo", "jetson_clocks"], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
       except Exception:
         pass
@@ -215,32 +241,25 @@ class Jetson(HardwareBase):
     self._watchdog_stop.set()
 
   def get_voltage(self) -> float:
-    """Read total bus voltage in millivolts from INA3221 power monitor."""
-    for channel in range(1, 4):
-      for base in ["/sys/bus/i2c/drivers/ina3221/1-0040/hwmon",
-                   "/sys/bus/i2c/drivers/ina3221x/1-0040/hwmon"]:
+    """Read bus voltage in millivolts from INA3221 power monitor (first discovered hwmon)."""
+    for hwmon in self._ina_paths():
+      for channel in range(1, 4):
         try:
-          if os.path.exists(base):
-            hwmon = os.listdir(base)[0]
-            with open(f"{base}/{hwmon}/in{channel}_input") as f:
-              return float(f.read().strip())  # millivolts
-        except (OSError, ValueError, IndexError):
+          with open(f"{hwmon}/in{channel}_input") as f:
+            return float(f.read().strip())  # millivolts
+        except (OSError, ValueError):
           continue
     return 0.0
 
   def get_current(self) -> float:
     """Read total bus current in milliamps from INA3221 power monitor."""
     total_ma = 0.0
-    for channel in range(1, 4):
-      for base in ["/sys/bus/i2c/drivers/ina3221/1-0040/hwmon",
-                   "/sys/bus/i2c/drivers/ina3221x/1-0040/hwmon"]:
+    for hwmon in self._ina_paths():
+      for channel in range(1, 4):
         try:
-          if os.path.exists(base):
-            hwmon = os.listdir(base)[0]
-            with open(f"{base}/{hwmon}/curr{channel}_input") as f:
-              total_ma += float(f.read().strip())
-            break
-        except (OSError, ValueError, IndexError):
+          with open(f"{hwmon}/curr{channel}_input") as f:
+            total_ma += float(f.read().strip())
+        except (OSError, ValueError):
           continue
     return total_ma
 

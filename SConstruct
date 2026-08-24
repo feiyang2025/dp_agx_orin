@@ -117,7 +117,9 @@ elif arch == "jarch64":
     "/usr/lib/aarch64-linux-gnu",
     "/usr/local/cuda/lib64",
   ])
-  arch_flags = ["-D__JETSON__", "-march=armv8.2-a+fp16+dotprod", "-mtune=cortex-a76"]
+  # AGX Xavier (t194): cortex-a76 | AGX Orin (t234, TW-T906G): cortex-a78ae
+  mtune = "cortex-a78ae" if os.path.exists("/proc/device-tree/model") and "Orin" in open("/proc/device-tree/model").read() else "cortex-a76"
+  arch_flags = ["-D__JETSON__", "-march=armv8.2-a+fp16+dotprod", f"-mtune={mtune}"]
   env.Append(CCFLAGS=arch_flags)
   env.Append(CXXFLAGS=arch_flags)
 elif arch == "Darwin":
