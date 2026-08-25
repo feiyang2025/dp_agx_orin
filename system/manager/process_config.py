@@ -83,8 +83,9 @@ procs = [
   PythonProcess("logmessaged", "system.logmessaged", always_run),
 
   NativeProcess("camerad", "system/camerad", ["./camerad"], driverview, enabled=not WEBCAM and not JETSON),
-  PythonProcess("jetson_camerad", "system.camerad.jetson_camerad", driverview, enabled=JETSON),
-  PythonProcess("webcamerad", "tools.webcam.camerad", driverview, enabled=WEBCAM and not JETSON),
+  # camerad self-heal: exit on camera stall and let the manager restart it
+  PythonProcess("jetson_camerad", "system.camerad.jetson_camerad", driverview, enabled=JETSON, restart_if_crash=True),
+  PythonProcess("webcamerad", "tools.webcam.camerad", driverview, enabled=WEBCAM and not JETSON, restart_if_crash=True),
   PythonProcess("proclogd", "system.proclogd", only_onroad, enabled=platform.system() != "Darwin"),
   PythonProcess("journald", "system.journald", only_onroad, platform.system() != "Darwin"),
   PythonProcess("micd", "system.micd", iscar, enabled=not LITE),

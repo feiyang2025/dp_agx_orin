@@ -1,7 +1,26 @@
 import os
+import platform
 
 import av
 import cv2 as cv
+
+
+def _is_uvc_device(camera_id) -> bool:
+  """Allow only real USB (uvcvideo) devices on Linux.
+
+  Opening tegra-video/VI nodes (CSI/GMSL raw capture) with OpenCV can stall the
+  V4L2 subsystem at kernel level and freeze the whole board - never do it here.
+  """
+  if platform.system() != "Linux":
+    return True
+  dev = f"/dev/video{camera_id}" if isinstance(camera_id, int) else str(camera_id)
+  name = os.path.basename(dev)
+  link = f"/sys/class/video4linux/{name}/device/driver"
+  try:
+    driver = os.path.basename(os.readlink(link))
+    return driver == "uvcvideo"
+  except OSError:
+    return False
 
 
 class Camera:
@@ -15,6 +34,12 @@ class Camera:
     self.cur_frame_id = 0
 
     print(f"Opening {cam_type_state} at {camera_id}")
+
+    if not _is_uvc_device(camera_id):
+      raise ValueError(
+        f"{camera_id} is not a UVC (USB) device - refusing to open non-uvcvideo "
+        "V4L2 nodes from the webcam path (kernel-stall risk)"
+      )
 
     self.cap = cv.VideoCapture(camera_id)
 

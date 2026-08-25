@@ -130,6 +130,56 @@ else
 fi
 echo ""
 
+# --- 4b. GPU Health & Driver Stack ---
+echo "4b. GPU Health"
+if command -v nvidia-smi &>/dev/null; then
+  if nvidia-smi &>/dev/null; then
+    GPU_INFO=$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | head -1)
+    check_pass "nvidia-smi OK: $GPU_INFO"
+  else
+    check_fail "nvidia-smi present but fails - GPU driver may be wedged (reboot before continuing)"
+  fi
+else
+  check_warn "nvidia-smi not found (JP6 should ship it; skip if intentional)"
+fi
+
+# Xid errors = GPU fault history (e.g. Xid 31 = page fault, Xid 43 = user hang).
+# Past Xids here are strong evidence for the 'UI appears then system freezes' failure mode.
+XID_COUNT=$(dmesg 2>/dev/null | grep -c "NVRM: Xid" || true)
+if [ "$XID_COUNT" -gt 0 ]; then
+  check_fail "$XID_COUNT GPU Xid error(s) in dmesg - run 'dmesg | grep NVRM' for details"
+else
+  check_pass "No GPU Xid errors in dmesg"
+fi
+echo ""
+
+# --- 4c. Python GPU Packages ---
+echo "4c. Python GPU Packages"
+PIP="${PY_OK:-python3} -m pip"
+if $PIP show tinygrad &>/dev/null; then
+  TG_VER=$($PIP show tinygrad 2>/dev/null | sed -n 's/^Version: //p')
+  check_pass "tinygrad: $TG_VER"
+else
+  check_fail "tinygrad not installed in this environment"
+fi
+
+# torch wheels bundle their own CUDA userspace libs; a cu12x wheel requiring a
+# newer driver than Jetson's can hard-hang the GPU at first cuda init.
+TORCH_INFO=$($PIP list 2>/dev/null | grep -iE "^torch " || echo "")
+if [ -n "$TORCH_INFO" ]; then
+  echo "    torch present: $TORCH_INFO"
+  echo "    NOTE: on Jetson use NVIDIA index wheels matching your JetPack, not generic cu12x pip wheels"
+  check_warn "torch installed - verify build matches driver 540.x / CUDA 12.6"
+fi
+
+NV_PIP=$($PIP list 2>/dev/null | grep -iE "^nvidia-" || echo "")
+if [ -n "$NV_PIP" ]; then
+  echo "    nvidia-* pip packages:"
+  echo "$NV_PIP" | sed 's/^/      /'
+  check_warn "nvidia-* pip wheels found - these bundle their own CUDA libs and may conflict with the system driver"
+fi
+echo ""
+
 # --- 5. OpenCL ---
 echo "5. OpenCL"
 if command -v clinfo &>/dev/null; then
