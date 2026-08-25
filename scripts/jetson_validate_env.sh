@@ -14,9 +14,9 @@ PASS=0
 FAIL=0
 WARN=0
 
-check_pass() { echo -e "  ${GREEN}[PASS]${NC} $1"; ((PASS++)); }
-check_fail() { echo -e "  ${RED}[FAIL]${NC} $1"; ((FAIL++)); }
-check_warn() { echo -e "  ${YELLOW}[WARN]${NC} $1"; ((WARN++)); }
+check_pass() { echo -e "  ${GREEN}[PASS]${NC} $1"; PASS=$((PASS + 1)); }
+check_fail() { echo -e "  ${RED}[FAIL]${NC} $1"; FAIL=$((FAIL + 1)); }
+check_warn() { echo -e "  ${YELLOW}[WARN]${NC} $1"; WARN=$((WARN + 1)); }
 
 echo "=============================================="
 echo " Jetson - Environment Validation"
@@ -56,7 +56,8 @@ esac
 if [ -f /etc/nv_tegra_release ]; then
   TEGRA_VER=$(head -1 /etc/nv_tegra_release)
   check_pass "Tegra release: $TEGRA_VER"
-  L4T_MAJOR=$(head -1 /etc/nv_tegra_release | grep -oP '(?<=R)\d+' || echo "0")
+  L4T_MAJOR=$(head -1 /etc/nv_tegra_release | sed -n 's/.* R\([0-9]\+\)\..*/\1/p')
+  [ -n "$L4T_MAJOR" ] || L4T_MAJOR="0"
   case "$L4T_MAJOR" in
     36) check_pass "L4T R36 detected (JetPack 6)" ;;
     35) if [ "$JETSOC" = "orin" ]; then check_warn "L4T R35 on Orin (JP5) - JP6 upgrade recommended"; else check_pass "L4T R35 detected (JetPack 5)"; fi ;;
@@ -79,7 +80,17 @@ for pver in python3.11 python3.12 python3.10; do
   fi
 done
 if [ -z "$PY_OK" ]; then
-  check_fail "No suitable Python (3.10/3.11/3.12) found"
+  # Fallback: bare python3 symlink (some distros only ship the unversioned name)
+  if command -v python3 &>/dev/null; then
+    PY_VER=$(python3 --version 2>&1)
+    case "$PY_VER" in
+      *3.1[012]*) check_pass "Python found via python3: $PY_VER" ;;
+      *) check_warn "python3 is $PY_VER - versioned python3.10/3.11/3.12 not found" ;;
+    esac
+    PY_OK="python3"
+  else
+    check_fail "No suitable Python (3.10/3.11/3.12) found"
+  fi
 fi
 
 if [ -n "$VIRTUAL_ENV" ]; then
@@ -94,7 +105,8 @@ echo ""
 echo "4. CUDA"
 if command -v nvcc &>/dev/null; then
   CUDA_VER=$(nvcc --version | grep "release" | awk '{print $6}')
-  CUDA_MAJOR=$(nvcc --version | grep -oP '(?<=release )\d+' || echo "0")
+  CUDA_MAJOR=$(nvcc --version | sed -n 's/.*release \([0-9]\+\).*/\1/p' | head -1)
+  [ -n "$CUDA_MAJOR" ] || CUDA_MAJOR="0"
   case "$CUDA_MAJOR" in
     12) check_pass "CUDA: $CUDA_VER (JetPack 6)" ;;
     13) check_warn "CUDA: $CUDA_VER (JetPack 7) - tinygrad compatibility unverified" ;;
@@ -278,9 +290,11 @@ for cam in /dev/video*; do
   esac
 done
 
-if [ -n "$ROAD_CAM" ]; then :; else ROAD_CAM="unset"; fi
-if [ -n "$WIDE_CAM" ]; then :; else WIDE_CAM="unset"; fi
-check_warn "Camera env: ROAD_CAM=$ROAD_CAM WIDE_CAM=$WIDE_CAM DRIVER_CAM=${DRIVER_CAM:-unset} USE_MJPEG=${USE_MJPEG:-unset} (set before launch)"
+# Camera environment: informational; warn only when required vars are missing
+echo "  Camera env: ROAD_CAM=${ROAD_CAM:-unset} WIDE_CAM=${WIDE_CAM:-unset} DRIVER_CAM=${DRIVER_CAM:-unset} USE_MJPEG=${USE_MJPEG:-unset}"
+if [ -z "$ROAD_CAM" ]; then
+  check_warn "ROAD_CAM not set - required for camera input (e.g. export ROAD_CAM=0)"
+fi
 echo ""
 
 # --- Summary ---
